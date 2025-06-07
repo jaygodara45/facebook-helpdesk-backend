@@ -15,7 +15,7 @@ class MessengerService:
         self.fb_api_version = "v18.0"
         self.fb_graph_url = f"https://graph.facebook.com/{self.fb_api_version}"
 
-    async def handle_incoming_message(self, webhook_event: Dict[str, Any], page_id: str) -> None:
+    async def handle_incoming_message(self, webhook_event: Dict[str, Any], page_id: str) -> Optional[Message]:
         """Handle incoming message from Facebook Messenger webhook"""
         messaging = webhook_event.get("messaging", [{}])[0]
         sender_id = messaging.get("sender", {}).get("id")
@@ -23,13 +23,12 @@ class MessengerService:
         message = messaging.get("message", {})
         print("Extract relevant things from webhook data...")
         if not sender_id or not message:
-            return
-
+            return None
 
         user = self.db.query(User).join(FacebookPage).filter(FacebookPage.id == page_id).first()
         
         if not user:
-            return
+            return None
         # Get or create chat
         chat = self.get_or_create_chat(user.id, sender_id)
         
@@ -48,6 +47,9 @@ class MessengerService:
         )
         self.db.add(new_message)
         self.db.commit()
+        self.db.refresh(new_message)
+        
+        return new_message
 
     def send_message(self, chat_id: int, message_text: str) -> Optional[str]:
         """Send message to Facebook user"""

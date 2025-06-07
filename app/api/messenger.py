@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from sqlalchemy.orm import Session
 from typing import List, Optional
 import hmac
@@ -12,6 +12,7 @@ from app.models.user import User
 from app.models.chat import Chat, Message
 from app.schemas.chat import ChatResponse, MessageResponse, SendMessageRequest
 from app.core.config import settings
+from app.core.websocket import manager
 
 router = APIRouter()
 
@@ -59,7 +60,19 @@ async def webhook(request: Request, db: Session = Depends(get_db)):
         
         for entry in body.get("entry", []):
             page_id = entry.get("id")
-            await messenger_service.handle_incoming_message(entry, page_id)
+            message = await messenger_service.handle_incoming_message(entry, page_id)
+            if message:
+                # Broadcast the new message to connected clients
+                await manager.broadcast_to_chat(message.chat_id, {
+                    "type": "new_message",
+                    "data": {
+                        "id": message.id,
+                        "content": message.content,
+                        "message_type": message.message_type,
+                        "fb_message_id": message.fb_message_id,
+                        "timestamp": message.timestamp.isoformat()
+                    }
+                })
         
         return {"success": True}
     
@@ -114,5 +127,44 @@ async def send_message(
     if not message_id:
         raise HTTPException(status_code=500, detail="Failed to send message")
     
-    # Return the newly created message
-    return db.query(Message).filter(Message.fb_message_id == message_id).first() 
+    # Get the newly created message
+    new_message = db.query(Message).filter(Message.fb_message_id == message_id).first()
+    
+    # Broadcast the new message to connected clients
+    await manager.broadcast_to_chat(chat_id, {
+        "type": "new_message",
+        "data": {
+            "id": new_message.id,
+            "content": new_message.content,
+            "message_type": new_message.message_type,
+            "fb_message_id": new_message.fb_message_id,
+            "timestamp": new_message.timestamp.isoformat()
+        }
+    })
+    
+    return new_message
+
+@router.websocket("/ws/{chat_id}")
+async def websocket_endpoint(
+    websocket: WebSocket,
+    chat_id: int,
+    db: Session = Depends(get_db)
+):
+    """WebSocket endpoint for real-time chat updates"""
+    try:
+        # Verify chat exists
+        chat = db.query(Chat).filter(Chat.id == chat_id).first()
+        if not chat:
+            await websocket.close(code=4004, reason="Chat not found")
+            return
+
+        await manager.connect(websocket, chat_id)
+        try:
+            while True:
+                # Keep the connection alive and handle any incoming messages
+                data = await websocket.receive_text()
+        except WebSocketDisconnect:
+            manager.disconnect(websocket, chat_id)
+    except Exception as e:
+        if not websocket.client_state.DISCONNECTED:
+            await websocket.close(code=4000) 
